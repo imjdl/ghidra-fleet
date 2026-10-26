@@ -1,0 +1,19 @@
+# virtualenv
+.venv/
+
+# python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ghidra-fleet runtime data (analyzed binaries / manifest)
+projects/
+
+# zcode session artifacts
+.zcode/
+
+# test / tooling caches
+.pytest_cache/
+.coverage

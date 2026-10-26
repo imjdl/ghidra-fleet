@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghidra-fleet"
+version = "0.1.0"
+description = "Headless multi-binary Ghidra analysis MCP server: one stdio server, many binaries, zero TCP ports."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Software Development :: Reverse Engineering",
+]
+dependencies = [
+    # tested against fastmcp 4.x only
+    "fastmcp>=4.0",
+]
+
+# NOTE: pyghidra / jpype1 are intentionally NOT PyPI dependencies here.
+# They must match the local Ghidra installation exactly and are installed
+# from the wheels bundled with Ghidra itself:
+#   <GHIDRA_INSTALL_DIR>/Ghidra/Features/PyGhidra/pypkg/dist/
+# See scripts/setup_env.bat
+
+[project.scripts]
+ghidra-fleet = "ghidra_fleet.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
