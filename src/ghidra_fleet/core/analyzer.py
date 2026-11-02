@@ -10,13 +10,14 @@ outside it.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 from ..util import sha256_file
 from .runtime import FleetError, runtime
@@ -30,18 +31,18 @@ class Analyzer:
     MAX_JOB_FILES = 1000
 
     def __init__(self) -> None:
-        self._jobs: Dict[str, Dict[str, Any]] = {}
+        self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._job_seq = 0
         # sha256 -> Event for imports in flight; dedupes identical content
         # submitted in the same batch (worker races otherwise double-import)
-        self._inflight: Dict[str, threading.Event] = {}
+        self._inflight: dict[str, threading.Event] = {}
 
     # ------------------------------------------------------------------ submit
 
     def submit(
-        self, paths: Union[str, List[str]], recursive: bool = False
-    ) -> Dict[str, Any]:
+        self, paths: str | list[str], recursive: bool = False
+    ) -> dict[str, Any]:
         files = self._expand(paths, recursive)
         if not files:
             raise FleetError("没有找到任何要分析的文件")
@@ -54,7 +55,7 @@ class Analyzer:
         with self._lock:
             self._job_seq += 1
             job_id = f"job{self._job_seq}_{uuid.uuid4().hex[:6]}"
-            job: Dict[str, Any] = {
+            job: dict[str, Any] = {
                 "job_id": job_id,
                 "submitted": time.time(),
                 "items": [
@@ -82,11 +83,11 @@ class Analyzer:
             "hint": "调用 analysis_status(job_id) 轮询进度；分析完成的二进制可立即查询",
         }
 
-    def _expand(self, paths: Union[str, List[str]], recursive: bool) -> List[str]:
+    def _expand(self, paths: str | list[str], recursive: bool) -> list[str]:
         if isinstance(paths, str):
             paths = [paths]
         project_root = runtime.cfg.project_dir.resolve()
-        out: List[str] = []
+        out: list[str] = []
         seen = set()
         for raw in paths:
             p = Path(raw).expanduser()
@@ -112,12 +113,43 @@ class Analyzer:
 
     # ------------------------------------------------------------------ worker
 
-    def _run_item(self, job: Dict[str, Any], item: Dict[str, Any]) -> None:
+    @staticmethod
+    def _progress_monitor(on_progress):
+        """Build a Ghidra TaskMonitor whose callback feeds on_progress(pct, msg).
+
+        PyGhidraTaskMonitor(timeout, TriConsumer) calls the consumer with
+        (progress, maximum, message); the timeout would auto-cancel analysis,
+        so it is set to a practically-infinite value.
+        """
+        import jpype  # type: ignore @UnresolvedImport
+        from ghidra.pyghidra import PyGhidraTaskMonitor  # type: ignore @UnresolvedImport
+        from jpype.types import JInt  # type: ignore @UnresolvedImport
+
+        @jpype.JImplements("org.apache.commons.lang3.function.TriConsumer")
+        class _Cb:
+            @jpype.JOverride
+            def accept(self, progress, maximum, message):
+                # progress reporting must never be able to break the analysis
+                with contextlib.suppress(Exception):
+                    maximum = int(maximum or 0)
+                    pct = int(int(progress or 0) * 100 // maximum) if maximum > 0 else None
+                    on_progress(pct, str(message) if message else "")
+
+        return PyGhidraTaskMonitor(JInt(24 * 3600), _Cb())
+
+    def _run_item(self, job: dict[str, Any], item: dict[str, Any]) -> None:
         item["status"] = "analyzing"
         item["started"] = time.time()
         path = item["path"]
-        sha: Optional[str] = None
-        leader: Optional[threading.Event] = None
+        sha: str | None = None
+        leader: threading.Event | None = None
+
+        def on_progress(pct, msg):
+            if pct is not None:
+                item["progress_pct"] = pct
+            if msg:
+                item["phase"] = msg[:80]
+
         try:
             runtime.ensure_started()
             sha = sha256_file(path)
@@ -140,11 +172,11 @@ class Analyzer:
                         break
                 ev.wait(timeout=300)
 
-            program_name = self._import_and_analyze(path, sha)
+            program_name = self._import_and_analyze(path, sha, on_progress)
             item["status"] = "done"
             item["program_name"] = program_name
             item["elapsed"] = round(time.time() - item["started"], 1)
-        except Exception as e:  # noqa: BLE001 - report per-file failures in the job
+        except Exception as e:
             log.exception("analysis failed for %s", path)
             item["status"] = "failed"
             item["error"] = f"{type(e).__name__}: {e}"[:400]
@@ -155,10 +187,10 @@ class Analyzer:
                     self._inflight.pop(sha, None)
                 leader.set()
 
-    def _import_and_analyze(self, path: str, sha: str) -> str:
-        from java.io import File  # type: ignore @UnresolvedImport
-        from ghidra.program.util import GhidraProgramUtilities  # type: ignore @UnresolvedImport
+    def _import_and_analyze(self, path: str, sha: str, on_progress=None) -> str:
         import pyghidra
+        from ghidra.program.util import GhidraProgramUtilities  # type: ignore @UnresolvedImport
+        from java.io import File  # type: ignore @UnresolvedImport
 
         base = f"{sha[:8]}__{Path(path).name}"
         with runtime.lock:
@@ -176,7 +208,10 @@ class Analyzer:
         # Long phase: run WITHOUT the runtime lock so other binaries analyze in parallel.
         try:
             if GhidraProgramUtilities.shouldAskToAnalyze(program):
-                pyghidra.analyze(program)
+                if on_progress is not None:
+                    pyghidra.analyze(program, monitor=self._progress_monitor(on_progress))
+                else:
+                    pyghidra.analyze(program)
         except Exception:
             with runtime.lock:
                 runtime._release_program(program)
@@ -199,7 +234,7 @@ class Analyzer:
 
     # ------------------------------------------------------------------ status
 
-    def status(self, job_id: Optional[str] = None) -> Dict[str, Any]:
+    def status(self, job_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             if job_id:
                 job = self._jobs.get(job_id)
@@ -214,6 +249,8 @@ class Analyzer:
                     {
                         "path": Path(i["path"]).name,
                         "status": i["status"],
+                        "progress_pct": i.get("progress_pct"),
+                        "phase": i.get("phase"),
                         "program_name": i.get("program_name"),
                         "cached": i.get("cached", False),
                         "elapsed": i.get("elapsed"),
@@ -242,7 +279,7 @@ class Analyzer:
                         active.add(item["path"])
             return active
 
-    def binaries_summary(self) -> List[Dict[str, Any]]:
+    def binaries_summary(self) -> list[dict[str, Any]]:
         """Manifest + live status rows behind the list_binaries tool."""
         runtime.ensure_started()
         active = self.active_paths()
@@ -252,6 +289,8 @@ class Analyzer:
                 orig = str(meta.get("original_path", ""))
                 if orig in active:
                     status = "analyzing"
+                elif not runtime._domain_file_exists(name):
+                    status = "missing"  # ghost entry: project file deleted manually
                 elif name in runtime._programs:
                     status = "open"
                 else:

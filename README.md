@@ -67,11 +67,13 @@ Linux/macOS 下 `command` 用 `<repo>/.venv/bin/python`。
 | 类别 | 工具 | 说明 |
 |---|---|---|
 | 舰队 | `analyze_binaries` | 批量导入+并行分析（目录也可，单批上限 1000 个文件），立即返回 job_id |
-| | `analysis_status` | 轮询作业进度（已完成的可立刻查询） |
-| | `list_binaries` | 所有二进制 + 架构/大小/哈希/状态 |
+| | `analysis_status` | 轮询作业进度（含每个文件的分析百分比/阶段，已完成的可立刻查询） |
+| | `list_binaries` | 所有二进制 + 架构/大小/哈希/状态（missing = 幽灵记录） |
+| | `delete_binary` | 删除一个二进制（项目文件 + manifest；也能清理幽灵记录） |
 | | `find_in_all_binaries` | **跨全部样本**搜同名函数/同字符串（找共享代码/家族特征，最多扫 200 个） |
 | 查询 | `list_functions` / `list_methods` / `search_functions_by_name` | 函数列表/搜索 |
-| | `decompile_function` / `disassemble_function` | 反编译 C / 反汇编 |
+| | `decompile_function` / `decompile_functions` | 反编译 C（单个 / 批量最多 50 个，错误内联） |
+| | `disassemble_function` | 反汇编 |
 | | `function_info` | 签名、参数、调用约定等 |
 | | `get_xrefs_to` / `get_xrefs_from` / `get_function_xrefs` | 交叉引用 |
 | | `list_imports` / `list_exports` / `list_segments` / `list_strings` | 导入导出/内存段/字符串 |
@@ -124,7 +126,10 @@ Linux/macOS 用 ls/true 等）。覆盖：并行分析、二次提交缓存跳�
 - **同一项目目录同一时间只允许一个 server 实例**（Ghidra 项目锁）：开多个 MCP 会话时，
   第一个实例占用项目，其余实例会收到明确的锁冲突提示。多会话请错开使用，
   或给不同会话配置不同的 `GHIDRA_FLEET_PROJECT_DIR`。关闭占用方后即可恢复。
+- **不要把 server 的启动脚本放在名为 `ghidra` 的目录下运行**（也不要让 sys.path[0]
+  指向这种目录）：Python 会把它当成 `ghidra` 命名空间包，与 pyghidra 的 Java 包
+  导入钩子冲突（递归爆栈）。用 `python -m ghidra_fleet` 从任意 cwd 启动是安全的。
 - 进程内并行分析在极少数格式上可能触发 Ghidra 分析器并发问题：把
   `GHIDRA_FLEET_MAX_WORKERS` 设为 `1` 即退化为顺序分析，接口不变。
-- 进度是按文件粒度（queued/analyzing/done/failed），没有百分比。
-- 删除二进制请直接删项目目录下对应文件并手工清 `manifest.json`（v1 未提供删除工具）。
+- 分析进度按文件粒度上报百分比；部分 Ghidra 分析阶段本身不提供总量，
+  此时只显示阶段名（progress_pct 为 null）。

@@ -21,12 +21,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 if not os.environ.get("GHIDRA_INSTALL_DIR"):
     print("ERROR: 请先设置 GHIDRA_INSTALL_DIR=<你的 Ghidra 安装目录> 再运行测试")
     raise SystemExit(1)
-os.environ.setdefault("GHIDRA_FLEET_PROJECT_DIR", str(Path(__file__).resolve().parents[1] / "projects"))
+_repo = Path(__file__).resolve().parents[1]
+os.environ.setdefault("GHIDRA_FLEET_PROJECT_DIR", str(_repo / "projects"))
 os.environ.setdefault("GHIDRA_FLEET_MAX_OPEN", "3")
 
-from ghidra_fleet.core import queries  # noqa: E402
-from ghidra_fleet.core.analyzer import analyzer  # noqa: E402
-from ghidra_fleet.core.runtime import runtime  # noqa: E402
+from ghidra_fleet.core import queries
+from ghidra_fleet.core.analyzer import analyzer
+from ghidra_fleet.core.runtime import runtime
 
 PASS = 0
 
@@ -195,13 +196,46 @@ def main() -> None:
                 time.sleep(2)
             items3 = analyzer.status(job3["job_id"])["jobs"][0]["items"]
             for i in items3:
-                print(f"  dup {i['path']}: {i['status']} cached={i.get('cached')} {i.get('program_name')}")
+                print(f"  dup {i['path']}: {i['status']} cached={i.get('cached')} {i.get('program_name')}")  # noqa: E501
             after = len(runtime.all_programs())
             check(
                 "duplicate content -> single manifest entry",
                 all(i["status"] == "done" for i in items3) and after == before + 1,
                 f"before={before} after={after}",
             )
+
+    # 10) batch decompile: mixed good + bad names, per-item inline errors
+    with runtime.acquire_program(targets[0]) as prog_b:
+        addrs = [r.split()[0] for r in queries.list_functions(prog_b, limit=3)]
+        batch = queries.decompile_functions(
+            prog_b, [*addrs, "definitely_not_a_function"], 800
+        )
+    check(
+        "batch decompile: all sections, good ones decompiled, bad one inline error",
+        len(batch) == 4
+        and sum(1 for b in batch if "===" in b) == 4
+        and sum(1 for b in batch if "{" in b) >= 2
+        and any("ERROR" in b for b in batch),
+        batch[0][:80],
+    )
+
+    # 11) delete_binary: real entry + ghost manifest entry
+    names = [r["program_name"] for r in analyzer.binaries_summary()]
+    dup_name = next(n for n in names if "dup_a" in n)
+    msg = runtime.delete_program(dup_name)
+    names_after = [r["program_name"] for r in analyzer.binaries_summary()]
+    check("delete_binary removes entry", dup_name not in names_after, msg)
+
+    runtime.add_manifest_entry(
+        "deadbeef__ghost.exe", {"sha256": "0" * 64, "original_path": "", "file_size": 0}
+    )
+    msg2 = runtime.delete_program("deadbeef__ghost.exe")
+    names_final = [r["program_name"] for r in analyzer.binaries_summary()]
+    check(
+        "delete_binary cleans ghost entry",
+        "deadbeef__ghost.exe" not in names_final and "清理" in msg2,
+        msg2,
+    )
 
     print(f"\nALL {PASS} CHECKS PASSED")
 

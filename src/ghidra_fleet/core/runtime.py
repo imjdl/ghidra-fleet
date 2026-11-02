@@ -1,20 +1,27 @@
 """FleetRuntime: JVM lifecycle, shared Ghidra project, manifest, program handle LRU.
 
-All Ghidra Java API access from tool threads must happen while holding
-``runtime.lock`` so the single embedded JVM is driven serially. Batch analysis
-is the exception: it runs ``pyghidra.analyze`` on background worker threads
-(one AutoAnalysisManager per program, parallel across programs).
+Locking model (deadlock-free by ordering: never take ``self.lock`` -> plock):
+
+- ``self.lock`` (global, short): protects the Ghidra project handle, the LRU
+  dict, the manifest and resolve/open/evict bookkeeping.
+- per-program RLock: held for the whole query/mutation on one program, so
+  different binaries can be queried in parallel while the same binary is
+  serialized against itself.
+- pin counters: programs with in-flight work are never evicted from the LRU.
+- Batch analysis is the exception: it runs ``pyghidra.analyze`` on background
+  worker threads (one AutoAnalysisManager per program, parallel across programs).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 log = logging.getLogger("ghidra_fleet.runtime")
 
@@ -25,7 +32,7 @@ class FleetError(RuntimeError):
 
 class Config:
     def __init__(self) -> None:
-        self.ghidra_install_dir: Optional[Path] = self._env_path("GHIDRA_INSTALL_DIR")
+        self.ghidra_install_dir: Path | None = self._env_path("GHIDRA_INSTALL_DIR")
         # stable regardless of install method (src checkout vs wheel) and cwd
         default_projects = Path.home() / ".ghidra_fleet" / "projects"
         self.project_dir: Path = self._env_path("GHIDRA_FLEET_PROJECT_DIR", default_projects)
@@ -34,10 +41,10 @@ class Config:
         self.max_workers: int = workers if workers > 0 else min(4, os.cpu_count() or 2)
         self.max_open: int = int(os.environ.get("GHIDRA_FLEET_MAX_OPEN", "6") or 6)
         # empty string disables the explicit heap override (falls back to Ghidra defaults)
-        self.xmx: Optional[str] = os.environ.get("GHIDRA_FLEET_XMX", "4G") or None
+        self.xmx: str | None = os.environ.get("GHIDRA_FLEET_XMX", "4G") or None
 
     @staticmethod
-    def _env_path(name: str, default: Optional[Path] = None) -> Optional[Path]:
+    def _env_path(name: str, default: Path | None = None) -> Path | None:
         value = os.environ.get(name, "").strip()
         return Path(value) if value else default
 
@@ -48,9 +55,11 @@ class FleetRuntime:
         self.lock = threading.RLock()
         self._started = False
         self._project = None  # ghidra.base.project.GhidraProject handle
-        self._programs: "OrderedDict[str, Any]" = OrderedDict()  # program_name -> Program (open)
-        self._decomp: Dict[str, Any] = {}  # program_name -> DecompInterface
-        self._manifest: Dict[str, Any] = {"version": 1, "programs": {}}
+        self._programs: OrderedDict[str, Any] = OrderedDict()  # program_name -> Program (open)
+        self._decomp: dict[str, Any] = {}  # program_name -> DecompInterface
+        self._plocks: dict[str, threading.RLock] = {}  # program_name -> per-program lock
+        self._pins: dict[str, int] = {}  # program_name -> in-flight use count
+        self._manifest: dict[str, Any] = {"version": 1, "programs": {}}
 
     # ------------------------------------------------------------------ startup
 
@@ -98,12 +107,13 @@ class FleetRuntime:
                     )
             except Exception as e:
                 if "LockException" in type(e).__name__ or "Unable to lock" in str(e):
+                    lock_file = self.cfg.project_dir / (self.cfg.project_name + ".lock")
                     raise FleetError(
                         f"Ghidra 项目被另一个 ghidra-fleet 实例占用"
                         f"（{self.cfg.project_dir / self.cfg.project_name}）。"
-                        f"同一时间只允许一个实例使用同一个项目目录：请关闭其他 ZCode 会话里的 "
+                        f"同一时间只允许一个实例使用同一个项目目录：请关闭其他会话里的 "
                         f"ghidra-fleet，或给不同会话配置不同的 GHIDRA_FLEET_PROJECT_DIR。"
-                        f"若确认没有其他实例，删除项目目录下的 {self.cfg.project_name}.lock 后重试。"
+                        f"若确认没有其他实例，删除 {lock_file} 后重试。"
                     ) from e
                 raise
             self._load_manifest()
@@ -133,18 +143,18 @@ class FleetRuntime:
         )
         tmp.replace(self.manifest_path)
 
-    def add_manifest_entry(self, program_name: str, meta: Dict[str, Any]) -> None:
+    def add_manifest_entry(self, program_name: str, meta: dict[str, Any]) -> None:
         with self.lock:
             self._manifest["programs"][program_name] = meta
             self._save_manifest()
 
-    def find_by_sha(self, sha256: str) -> Optional[str]:
+    def find_by_sha(self, sha256: str) -> str | None:
         for name, meta in self._manifest["programs"].items():
             if meta.get("sha256") == sha256:
                 return name
         return None
 
-    def all_programs(self) -> Dict[str, Dict[str, Any]]:
+    def all_programs(self) -> dict[str, dict[str, Any]]:
         return dict(self._manifest["programs"])
 
     # ------------------------------------------------------------------ resolve
@@ -215,8 +225,9 @@ class FleetRuntime:
     def _register(self, name: str, prog) -> None:
         self._programs[name] = prog
         while len(self._programs) > self.cfg.max_open:
-            oldest = next(iter(self._programs))
-            if oldest == name:
+            # pinned programs are in active use: let the cache overshoot for now
+            oldest = next((n for n in self._programs if self._pins.get(n, 0) == 0), None)
+            if oldest is None or oldest == name:
                 break
             self._evict(oldest)
 
@@ -224,17 +235,98 @@ class FleetRuntime:
         prog = self._programs.pop(name, None)
         ifc = self._decomp.pop(name, None)
         if ifc is not None:
-            try:
+            with contextlib.suppress(Exception):
                 ifc.dispose()
-            except Exception:
-                log.exception("decompiler dispose failed for %s", name)
         if prog is None:
             return
         try:
-            self._project.save(prog)
+            if prog.isChanged():
+                self._project.save(prog)
         except Exception:
             log.exception("save before evict failed for %s", name)
         self._release_program(prog)
+
+    def _pin(self, name: str) -> threading.RLock:
+        self._pins[name] = self._pins.get(name, 0) + 1
+        return self._plocks.setdefault(name, threading.RLock())
+
+    def _unpin(self, name: str) -> None:
+        left = self._pins.get(name, 1) - 1
+        if left > 0:
+            self._pins[name] = left
+        else:
+            self._pins.pop(name, None)
+
+    @contextlib.contextmanager
+    def acquire_program(self, binary: str):
+        """Resolve + open + pin a program and hold its per-program lock.
+
+        Use this from tool implementations: queries on different binaries run
+        in parallel; queries on the same binary are serialized.
+        """
+        with self.lock:
+            self.ensure_started()
+            name = self.resolve_name(binary)
+            prog = self.get_program(name)  # RLock re-entrant; LRU touched
+            plock = self._pin(name)
+        try:
+            with plock:
+                yield prog
+        finally:
+            with self.lock:
+                self._unpin(name)
+
+    @contextlib.contextmanager
+    def temp_program(self, binary: str):
+        """Open a program for a short read-only scan without LRU churn.
+
+        Reuses an already-open handle when available, otherwise opens and
+        releases a temporary one - avoids evict/save cycles when scanning a
+        large fleet with a small max_open cache.
+        """
+        with self.lock:
+            self.ensure_started()
+            name = self.resolve_name(binary)
+            plock = self._pin(name)
+            existing = self._programs.get(name)
+            if existing is not None:
+                self._programs.move_to_end(name)
+                prog, owned = existing, False
+            else:
+                prog, owned = self._project.openProgram("/", name, False), True
+        try:
+            with plock:
+                yield prog
+        finally:
+            with self.lock:
+                self._unpin(name)
+                if owned:
+                    self._release_program(prog)
+
+    def delete_program(self, binary: str) -> str:
+        """Delete a binary's project file and manifest entry."""
+        with self.lock:
+            self.ensure_started()
+            name = self.resolve_name(binary)
+            if self._pins.get(name, 0) > 0:
+                raise FleetError(f"'{name}' 正在被查询/分析使用，请稍后再删除")
+            df = self._project.getRootFolder().getFile(name)
+            if name in self._programs:
+                self._evict(name)
+            if df is None:
+                # ghost manifest entry: project file already gone
+                self._manifest["programs"].pop(name, None)
+                self._save_manifest()
+                return f"'{name}' 的项目文件已不存在，已清理 manifest 记录"
+            try:
+                df.delete()  # void + IOException in Ghidra 12 (no boolean return)
+            except Exception as e:
+                raise FleetError(
+                    f"删除 '{name}' 的项目文件失败（文件可能仍被占用）: {e}"
+                ) from e
+            self._manifest["programs"].pop(name, None)
+            self._save_manifest()
+            return f"已删除 '{name}'（项目文件 + manifest 记录）"
 
     def _release_program(self, prog) -> None:
         # GhidraProject owns the consumer handle for programs it opened/imported.
@@ -251,11 +343,22 @@ class FleetRuntime:
             self._project.save(prog)
 
     def get_decompiler(self, prog):
-        key = prog.getName()
+        # Cache by the canonical program_name (not prog.getName()): the
+        # internal name is just the original file name, so two same-named
+        # binaries with different content would otherwise share one
+        # DecompInterface, and eviction (keyed by canonical name) would never
+        # dispose the right one -> "File is closed" on reopen.
+        key = None
+        for name, p in self._programs.items():
+            if p is prog:
+                key = name
+                break
+        if key is None:
+            key = prog.getName()  # temp handle outside the LRU: best effort
         ifc = self._decomp.get(key)
         if ifc is not None:
             return ifc
-        from ghidra.app.decompiler import DecompInterface, DecompileOptions
+        from ghidra.app.decompiler import DecompileOptions, DecompInterface
 
         ifc = DecompInterface()
         ifc.setOptions(DecompileOptions())
@@ -263,7 +366,7 @@ class FleetRuntime:
         self._decomp[key] = ifc
         return ifc
 
-    def program_meta(self, prog) -> Dict[str, Any]:
+    def program_meta(self, prog) -> dict[str, Any]:
         meta = {
             "name": str(prog.getName()),
             "language": str(prog.getLanguageID()),

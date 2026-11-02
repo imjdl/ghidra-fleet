@@ -7,7 +7,7 @@ done inside the functions on purpose: they only resolve after the JVM started.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+import contextlib
 
 from ..util import MAX_SCAN, clamp_limit, clamp_offset, truncate
 from .runtime import FleetError, runtime
@@ -33,6 +33,9 @@ def _require_addr(program, value: str):
     return addr
 
 
+MAX_FUZZY_SCAN = 100_000  # cap the substring scan on huge programs
+
+
 def resolve_function(program, name_or_address: str):
     """Find a function by entry address, exact name, or unique substring."""
     fm = program.getFunctionManager()
@@ -56,29 +59,29 @@ def resolve_function(program, name_or_address: str):
 
     needle = raw.lower()
     matches = []
-    for f in fm.getFunctions(True):
+    for scanned, f in enumerate(fm.getFunctions(True)):
         if needle in f.getName(True).lower():
             matches.append(f)
             if len(matches) >= 10:
                 break
+        if scanned >= MAX_FUZZY_SCAN:
+            break
     if len(matches) == 1:
         return matches[0]
     if matches:
+        candidates = [f"{m.getName(True)} @ {m.getEntryPoint()}" for m in matches]
         raise FleetError(
-            f"'{raw}' 非唯一，匹配到: {[m.getName(True) + ' @ ' + str(m.getEntryPoint()) for m in matches]}。"
-            f"请用完整名称或入口地址"
+            f"'{raw}' 非唯一，匹配到: {candidates}。请用完整名称或入口地址"
         )
     raise FleetError(
         f"找不到函数 '{raw}'。用 list_functions 查看函数列表或 search_functions_by_name 搜索"
     )
 
 
-def _string_value(data) -> Optional[str]:
-    try:
+def _string_value(data) -> str | None:
+    with contextlib.suppress(Exception):  # hasStringValue missing on odd data units
         if not data.hasStringValue():
             return None
-    except Exception:
-        pass
     try:
         v = data.getValue()
         return v if isinstance(v, str) else None
@@ -103,11 +106,11 @@ def _fmt_ref(program, ref) -> str:
 
 
 def list_functions(
-    program, flt: Optional[str] = None, offset: int = 0, limit: int = 100
-) -> List[str]:
+    program, flt: str | None = None, offset: int = 0, limit: int = 100
+) -> list[str]:
     offset, limit = clamp_offset(offset), clamp_limit(limit)
     needle = (flt or "").lower()
-    rows: List[str] = []
+    rows: list[str] = []
     skipped = 0
     for f in program.getFunctionManager().getFunctions(True):
         name = f.getName(True)
@@ -122,10 +125,10 @@ def list_functions(
     return rows
 
 
-def search_functions_by_name(program, query: str, limit: int = 50) -> List[str]:
+def search_functions_by_name(program, query: str, limit: int = 50) -> list[str]:
     needle = str(query).lower()
     limit = clamp_limit(limit)
-    rows: List[str] = []
+    rows: list[str] = []
     for f in program.getFunctionManager().getFunctions(True):
         if needle in f.getName(True).lower():
             rows.append(f"{f.getEntryPoint()}  {f.getName(True)}")
@@ -148,12 +151,15 @@ def function_info(program, name_or_address: str) -> dict:
     }
 
 
-def decompile(program, name_or_address: str, max_chars: Optional[int] = None) -> str:
+def decompile(
+    program, name_or_address: str, max_chars: int | None = None, timeout_s: int = 90
+) -> str:
     f = resolve_function(program, name_or_address)
     ifc = runtime.get_decompiler(program)
     from ghidra.util.task import TaskMonitor  # type: ignore @UnresolvedImport
 
-    result = ifc.decompileFunction(f, 90, TaskMonitor.DUMMY)
+    timeout_s = max(5, min(int(timeout_s), 600))
+    result = ifc.decompileFunction(f, timeout_s, TaskMonitor.DUMMY)
     if not result.decompileCompleted() or result.getDecompiledFunction() is None:
         raise FleetError(f"反编译失败: {result.getErrorMessage()}")
     code = result.getDecompiledFunction().getC()
@@ -161,21 +167,32 @@ def decompile(program, name_or_address: str, max_chars: Optional[int] = None) ->
     return truncate(header + code, max_chars)
 
 
+def decompile_functions(
+    program, names: list[str], max_chars_each: int = 4000, timeout_s: int = 90
+) -> list[str]:
+    """Batch decompile; per-function failures are reported inline, not raised."""
+    out: list[str] = []
+    for name in names[:50]:
+        try:
+            out.append(f"=== {name} ===\n{decompile(program, name, max_chars_each, timeout_s)}")
+        except Exception as e:
+            out.append(f"=== {name} ===\nERROR: {e}")
+    return out
+
+
 def disassemble(program, name_or_address: str, max_lines: int = 200) -> str:
     f = resolve_function(program, name_or_address)
     max_lines = max(1, min(int(max_lines), 2000))
     lines = [f"; {f.getName(True)} @ {f.getEntryPoint()}"]
-    count = 0
-    for ins in program.getListing().getInstructions(f.getBody(), True):
+    for count, ins in enumerate(program.getListing().getInstructions(f.getBody(), True)):
         lines.append(f"{ins.getAddress()}  {ins}")
-        count += 1
-        if count >= max_lines:
+        if count + 1 >= max_lines:
             lines.append("; ... [已达 max_lines 上限]")
             break
     return "\n".join(lines)
 
 
-def xrefs_to(program, address: str) -> List[str]:
+def xrefs_to(program, address: str) -> list[str]:
     addr = _require_addr(program, address)
     rm = program.getReferenceManager()
     rows = [_fmt_ref(program, r) for r in rm.getReferencesTo(addr)]
@@ -184,18 +201,18 @@ def xrefs_to(program, address: str) -> List[str]:
     return rows
 
 
-def xrefs_from(program, address: str) -> List[str]:
+def xrefs_from(program, address: str) -> list[str]:
     addr = _require_addr(program, address)
     rm = program.getReferenceManager()
     rows = []
     for r in rm.getReferencesFrom(addr):
-        rows.append(f"{r.getFromAddress()}  {str(r.getReferenceType()):<12} -> {r.getToAddress()}")
+        rows.append(f"{r.getFromAddress()}  {r.getReferenceType()!s:<12} -> {r.getToAddress()}")
     if not rows:
         return [f"地址 {addr} 没有向外的引用"]
     return rows
 
 
-def function_xrefs(program, name_or_address: str) -> List[str]:
+def function_xrefs(program, name_or_address: str) -> list[str]:
     f = resolve_function(program, name_or_address)
     rm = program.getReferenceManager()
     rows = [_fmt_ref(program, r) for r in rm.getReferencesTo(f.getEntryPoint())]
@@ -204,9 +221,9 @@ def function_xrefs(program, name_or_address: str) -> List[str]:
     return rows
 
 
-def list_imports(program, offset: int = 0, limit: int = 100) -> List[str]:
+def list_imports(program, offset: int = 0, limit: int = 100) -> list[str]:
     offset, limit = clamp_offset(offset), clamp_limit(limit)
-    rows: List[str] = []
+    rows: list[str] = []
     em = program.getExternalManager()
     for lib in em.getExternalLibraryNames():
         for loc in em.getExternalLocations(lib):
@@ -216,10 +233,10 @@ def list_imports(program, offset: int = 0, limit: int = 100) -> List[str]:
     return rows[offset : offset + limit] if rows else ["(无导入符号)"]
 
 
-def list_exports(program, offset: int = 0, limit: int = 100) -> List[str]:
+def list_exports(program, offset: int = 0, limit: int = 100) -> list[str]:
     offset, limit = clamp_offset(offset), clamp_limit(limit)
     st = program.getSymbolTable()
-    rows: List[str] = []
+    rows: list[str] = []
     it = st.getExternalEntryPointIterator()
     while it.hasNext():
         addr = it.next()
@@ -229,10 +246,14 @@ def list_exports(program, offset: int = 0, limit: int = 100) -> List[str]:
     return rows[offset : offset + limit] if rows else ["(无导出符号)"]
 
 
-def list_segments(program) -> List[str]:
+def list_segments(program) -> list[str]:
     rows = []
     for b in program.getMemory().getBlocks():
-        perms = ("r" if b.isRead() else "-") + ("w" if b.isWrite() else "-") + ("x" if b.isExecute() else "-")
+        perms = (
+            ("r" if b.isRead() else "-")
+            + ("w" if b.isWrite() else "-")
+            + ("x" if b.isExecute() else "-")
+        )
         rows.append(
             f"{b.getStart()}-{b.getEnd()}  {b.getName():<12} {perms}  {int(b.getSize())} bytes"
         )
@@ -240,11 +261,11 @@ def list_segments(program) -> List[str]:
 
 
 def list_strings(
-    program, flt: Optional[str] = None, offset: int = 0, limit: int = 100
-) -> List[str]:
+    program, flt: str | None = None, offset: int = 0, limit: int = 100
+) -> list[str]:
     offset, limit = clamp_offset(offset), clamp_limit(limit)
     needle = (flt or "").lower()
-    rows: List[str] = []
+    rows: list[str] = []
     scanned = 0
     skipped = 0
     it = program.getListing().getDefinedData(True)
@@ -359,12 +380,11 @@ def set_function_prototype(program, function: str, prototype: str) -> str:
     except Exception as e:
         raise FleetError(
             f"无法解析函数签名 '{prototype}'（示例: 'int func(char *buf, int len)'）: {e}"
-        )
+        ) from e
     if conv:
-        try:
+        # convention not valid for this language: keep the default silently
+        with contextlib.suppress(Exception):
             fd.setCallingConvention(conv)
-        except Exception:
-            pass  # convention not valid for this language: keep the default
 
     with transaction(program, "ghidra-fleet set_function_prototype"):
         cmd = ApplyFunctionSignatureCmd(f.getEntryPoint(), fd, SourceType.USER_DEFINED)
@@ -402,7 +422,7 @@ def set_local_variable_type(program, function: str, variable_name: str, new_type
             if fd is not None:
                 dt = fd.getReturnType()
                 break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
     if dt is None:
         raise FleetError(f"无法解析类型 '{new_type}': {last_err}")
@@ -445,23 +465,23 @@ def set_comment(program, address: str, comment: str, kind: str = "eol") -> str:
 # --------------------------------------------------------------------- fleet-wide
 
 
-def find_in_all_binaries(kind: str, query: str, limit_per_binary: int = 20) -> List[str]:
+def find_in_all_binaries(kind: str, query: str, limit_per_binary: int = 20) -> list[str]:
     kind = (kind or "").lower()
     if kind not in ("string", "function"):
         raise FleetError("kind 必须是 'string' 或 'function'")
-    rows: List[str] = []
+    rows: list[str] = []
     programs = list(runtime.all_programs().items())[:200]  # bound output for big fleets
-    for name, meta in programs:
+    for name, _meta in programs:
         try:
-            program = runtime.get_program(name)
+            # temp handle: no LRU evict/save churn on big fleets
+            with runtime.temp_program(name) as program:
+                if kind == "function":
+                    hits = search_functions_by_name(program, query, limit_per_binary)
+                else:
+                    hits = list_strings(program, flt=query, limit=limit_per_binary)
         except Exception as e:
             rows.append(f"[{name}] 打开失败: {e}")
             continue
-        hits: List[str] = []
-        if kind == "function":
-            hits = search_functions_by_name(program, query, limit_per_binary)
-        else:
-            hits = list_strings(program, flt=query, limit=limit_per_binary)
         if hits:
             rows.append(f"=== {name} ({len(hits)} hits) ===")
             rows.extend(hits)

@@ -10,6 +10,7 @@ protocol clean we:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -20,10 +21,8 @@ def main() -> None:
     os.dup2(2, 1)  # native/JVM stdout now goes to stderr
 
     stream = os.fdopen(real_fd, "w", encoding="utf-8", buffering=1)
-    try:
+    with contextlib.suppress(Exception):  # not every stream supports reconfigure
         stream.reconfigure(write_through=True)
-    except Exception:
-        pass
     sys.stdout = stream
 
     level = os.environ.get("GHIDRA_FLEET_LOG", "INFO").upper()
@@ -37,10 +36,8 @@ def main() -> None:
 
     log = logging.getLogger("ghidra_fleet")
     log.info("ghidra-fleet starting (stdio), ghidra=%s", os.environ.get("GHIDRA_INSTALL_DIR"))
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         mcp.run(transport="stdio")
-    except KeyboardInterrupt:
-        pass
     # stdio closed (client gone): the embedded JVM and analysis worker threads
     # are non-daemon and can hang a clean interpreter shutdown, leaving zombie
     # processes that hold the Ghidra project lock. Hard-exit instead.

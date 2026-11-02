@@ -11,6 +11,12 @@ dist/
 # ghidra-fleet runtime data (analyzed binaries / manifest)
 projects/
 
+# local analysis targets - never commit sample binaries
+samples/
+*.so
+*.dll
+*.exe
+
 # zcode session artifacts
 .zcode/
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ghidra-fleet"
-version = "0.1.0"
+version = "0.2.0"
 description = "Headless multi-binary Ghidra analysis MCP server: one stdio server, many binaries, zero TCP ports."
 readme = "README.md"
 license = { text = "MIT" }
@@ -31,3 +31,26 @@ ghidra-fleet = "ghidra_fleet.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "S", "SIM", "RUF", "BLE"]
+ignore = [
+    # MCP tools deliberately catch broad exceptions and return error text:
+    # a crashing tool would kill the whole AI workflow for one bad input.
+    "BLE001",
+    # user-facing messages are Chinese with full-width punctuation by design
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # test scripts run against unspecified system paths
+    "S108",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# test scripts legitimately use asserts, prints, broad excepts, and must set
+# env vars (GHIDRA_INSTALL_DIR) before importing the package under test
+"tests/*" = ["S101", "BLE001", "T201", "E402"]
