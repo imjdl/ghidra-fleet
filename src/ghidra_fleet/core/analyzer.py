@@ -11,6 +11,7 @@ outside it.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -83,9 +84,28 @@ class Analyzer:
             "hint": "调用 analysis_status(job_id) 轮询进度；分析完成的二进制可立即查询",
         }
 
-    def _expand(self, paths: str | list[str], recursive: bool) -> list[str]:
+    @staticmethod
+    def _normalize_paths(paths: str | list[str]) -> list[str]:
+        """Coerce sloppy client input into a flat list of path strings.
+
+        LLM clients sometimes stringify the whole array instead of sending a
+        real list ('[\"a.exe\", \"b.exe\"]' as one string) - unpack that.
+        """
         if isinstance(paths, str):
             paths = [paths]
+        out: list[str] = []
+        for p in paths:
+            if isinstance(p, str) and p.lstrip().startswith("["):
+                with contextlib.suppress(Exception):
+                    parsed = json.loads(p)
+                    if isinstance(parsed, list):
+                        out.extend(str(x) for x in parsed)
+                        continue
+            out.append(str(p))
+        return out
+
+    def _expand(self, paths: str | list[str], recursive: bool) -> list[str]:
+        paths = self._normalize_paths(paths)
         project_root = runtime.cfg.project_dir.resolve()
         out: list[str] = []
         seen = set()
@@ -108,7 +128,10 @@ class Analyzer:
                     seen.add(key)
                     out.append(key)
             else:
-                raise FleetError(f"路径不存在: {raw}")
+                raise FleetError(
+                    f"路径不存在: '{raw}'。请确认盘符/路径正确；"
+                    f"paths 参数请传数组（如 [\"C:/a.exe\"]），不要传 JSON 字符串"
+                )
         return out
 
     # ------------------------------------------------------------------ worker

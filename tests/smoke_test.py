@@ -220,8 +220,13 @@ def main() -> None:
     )
 
     # 11) delete_binary: real entry + ghost manifest entry
-    names = [r["program_name"] for r in analyzer.binaries_summary()]
-    dup_name = next(n for n in names if "dup_a" in n)
+    # which copy wins the in-flight race is timing-dependent: take the actual
+    # manifest entry name from the job status instead of assuming dup_a
+    dup_name = next(
+        i.get("program_name")
+        for i in analyzer.status(job3["job_id"])["jobs"][0]["items"]
+        if i.get("program_name")
+    )
     msg = runtime.delete_program(dup_name)
     names_after = [r["program_name"] for r in analyzer.binaries_summary()]
     check("delete_binary removes entry", dup_name not in names_after, msg)
@@ -235,6 +240,17 @@ def main() -> None:
         "delete_binary cleans ghost entry",
         "deadbeef__ghost.exe" not in names_final and "清理" in msg2,
         msg2,
+    )
+
+    # 12) clients sometimes stringify the paths array - must be unpacked
+    import json as _json
+
+    as_json_string = _json.dumps([targets[0], targets[1]])
+    expanded = analyzer._normalize_paths(as_json_string)
+    check(
+        "JSON-stringified paths array unpacked",
+        expanded == [targets[0], targets[1]],
+        str(expanded),
     )
 
     print(f"\nALL {PASS} CHECKS PASSED")
